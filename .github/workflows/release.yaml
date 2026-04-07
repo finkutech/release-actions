@@ -56,7 +56,8 @@ jobs:
             TICKET_TEXT=""
           fi
 
-          TEXT=":eyes: *Review requested* — <${PR_URL}|#${PR_NUM} ${PR_TITLE}>\n:bust_in_silhouette: ${PR_AUTHOR} → \`${PR_BRANCH}\` → \`staging\`${TICKET_TEXT}"
+          REVIEWERS="<@U050ZKVN022> <@U058JKUUY8K> <@U05D5MQEDGC>"
+          TEXT=":eyes: *Review requested* — <${PR_URL}|#${PR_NUM} ${PR_TITLE}>\n:bust_in_silhouette: ${PR_AUTHOR} → \`${PR_BRANCH}\` → \`staging\`${TICKET_TEXT}\n:bellhop_bell: ${REVIEWERS}"
 
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-type: application/json' \
