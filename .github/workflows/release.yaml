@@ -143,35 +143,6 @@ jobs:
 
           gh pr edit "$PR_NUMBER" --body "$NEW_BODY"
 
-      - name: Notify Slack
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
-          PR_EXISTS: ${{ steps.check_pr.outputs.exists }}
-          PR_NUMBER: ${{ steps.check_pr.outputs.pr_number }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "No Slack webhook configured, skipping notification"
-            exit 0
-          fi
-
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          REPO="${{ github.repository }}"
-
-          if [ "$PR_EXISTS" = "false" ]; then
-            RELEASE_PR_URL="https://github.com/${REPO}/pulls?q=is%3Aopen+release+${VERSION}"
-            TEXT=":rocket: *New release started: ${VERSION}*\n\n:package: <${PR_URL}|${PR_TITLE}> by ${PR_AUTHOR} merged to staging\n:memo: Release PR created in <${RELEASE_PR_URL}|${REPO}>"
-          else
-            RELEASE_PR_URL="https://github.com/${REPO}/pull/${PR_NUMBER}"
-            TEXT=":package: *${REPO}* — <${PR_URL}|${PR_TITLE}> by ${PR_AUTHOR} merged to staging\n:memo: <${RELEASE_PR_URL}|Release PR #${PR_NUMBER}> updated"
-          fi
-
-          curl -s -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d "{\"text\": \"${TEXT}\"}"
-
   tag-release:
     if: >-
       github.event.pull_request.merged == true
