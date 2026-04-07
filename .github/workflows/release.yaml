@@ -24,6 +24,44 @@ on:
         required: false
 
 jobs:
+  notify-pr-opened:
+    if: >-
+      github.event.action == 'opened'
+      && github.event.pull_request.base.ref == inputs.staging-branch
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Notify Slack for review
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+          JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No Slack webhook configured, skipping notification"
+            exit 0
+          fi
+
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          REPO="${{ github.repository }}"
+
+          TICKET=$(echo "$PR_BRANCH" | grep -oP '[A-Z]+-\d+' | head -1)
+          if [ -n "$TICKET" ]; then
+            TICKET_TEXT=" | <${JIRA_BASE_URL}/${TICKET}|${TICKET}>"
+          else
+            TICKET_TEXT=""
+          fi
+
+          TEXT=":eyes: *Review requested* — <${PR_URL}|#${PR_NUM} ${PR_TITLE}>\n:bust_in_silhouette: ${PR_AUTHOR} → \`${PR_BRANCH}\` → \`staging\`${TICKET_TEXT}"
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-type: application/json' \
+            -d "{\"text\": \"${TEXT}\"}"
+
   manage-release-pr:
     if: >-
       github.event.pull_request.merged == true
