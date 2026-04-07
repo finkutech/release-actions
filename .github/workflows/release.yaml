@@ -236,7 +236,8 @@ jobs:
           REPO="${{ github.repository }}"
           RELEASE_URL="https://github.com/${REPO}/releases/tag/${VERSION}"
 
-          TEXT=":white_check_mark: *${REPO} released ${VERSION}*\n\n:link: <${RELEASE_URL}|View release notes>\n:ship: Production deploy triggered"
+          REVIEWERS="<@U050ZKVN022> <@U058JKUUY8K> <@U05D5MQEDGC>"
+          TEXT=":white_check_mark: *${REPO} released ${VERSION}*\n\n:link: <${RELEASE_URL}|View release notes>\n:ship: Production deploy triggered\n\ncc ${REVIEWERS}"
 
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-type: application/json' \
