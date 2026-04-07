@@ -1,0 +1,19 @@
+# Example caller workflow — copy to .github/workflows/release.yaml in your repo
+name: Release Management
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - staging
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    uses: finkutech/release-actions/.github/workflows/release.yaml@main
+    secrets:
+      slack-webhook-url: ${{ secrets.SLACK_RELEASE_WEBHOOK_URL }}

@@ -13,6 +13,15 @@ on:
         required: false
         type: string
         default: "main"
+      jira-base-url:
+        description: "JIRA browse base URL for ticket linking"
+        required: false
+        type: string
+        default: "https://finkutech.atlassian.net/browse"
+    secrets:
+      slack-webhook-url:
+        description: "Slack Incoming Webhook URL for release notifications"
+        required: false
 
 jobs:
   manage-release-pr:
@@ -69,6 +78,9 @@ jobs:
           fi
 
       - name: Build change entry
+        id: entry
+        env:
+          JIRA_BASE_URL: ${{ inputs.jira-base-url }}
         run: |
           PR_NUM="${{ github.event.pull_request.number }}"
           PR_TITLE="${{ github.event.pull_request.title }}"
@@ -76,7 +88,14 @@ jobs:
           PR_BRANCH="${{ github.event.pull_request.head.ref }}"
           MERGE_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
 
-          echo "| #${PR_NUM} | ${PR_TITLE} | @${PR_AUTHOR} | \`${PR_BRANCH}\` | ${MERGE_DATE} |" > /tmp/entry.txt
+          TICKET=$(echo "$PR_BRANCH" | grep -oP '[A-Z]+-\d+' | head -1)
+          if [ -n "$TICKET" ]; then
+            TICKET_LINK="[${TICKET}](${JIRA_BASE_URL}/${TICKET})"
+          else
+            TICKET_LINK="-"
+          fi
+
+          echo "| #${PR_NUM} | ${PR_TITLE} | @${PR_AUTHOR} | \`${PR_BRANCH}\` | ${TICKET_LINK} | ${MERGE_DATE} |" > /tmp/entry.txt
 
       - name: Create release PR
         if: steps.check_pr.outputs.exists == 'false'
@@ -98,8 +117,8 @@ jobs:
           ### Changes in this release
 
           <!-- RELEASE_CHANGES_START -->
-          | PR | Title | Author | Branch | Merged |
-          |---|---|---|---|---|
+          | PR | Title | Author | Branch | Ticket | Merged |
+          |---|---|---|---|---|---|
           ${ENTRY}
           <!-- RELEASE_CHANGES_END -->
 
@@ -123,6 +142,31 @@ jobs:
           ${ENTRY}")
 
           gh pr edit "$PR_NUMBER" --body "$NEW_BODY"
+
+      - name: Notify Slack
+        if: ${{ secrets.slack-webhook-url != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+          PR_EXISTS: ${{ steps.check_pr.outputs.exists }}
+          PR_NUMBER: ${{ steps.check_pr.outputs.pr_number }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          REPO="${{ github.repository }}"
+
+          if [ "$PR_EXISTS" = "false" ]; then
+            RELEASE_PR_URL="https://github.com/${REPO}/pulls?q=is%3Aopen+release+${VERSION}"
+            TEXT=":rocket: *New release started: ${VERSION}*\n\n:package: <${PR_URL}|${PR_TITLE}> by ${PR_AUTHOR} merged to staging\n:memo: Release PR created in <${RELEASE_PR_URL}|${REPO}>"
+          else
+            RELEASE_PR_URL="https://github.com/${REPO}/pull/${PR_NUMBER}"
+            TEXT=":package: *${REPO}* — <${PR_URL}|${PR_TITLE}> by ${PR_AUTHOR} merged to staging\n:memo: <${RELEASE_PR_URL}|Release PR #${PR_NUMBER}> updated"
+          fi
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-type: application/json' \
+            -d "{\"text\": \"${TEXT}\"}"
 
   tag-release:
     if: >-
@@ -164,3 +208,18 @@ jobs:
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes "$BODY"
+
+      - name: Notify Slack
+        if: ${{ secrets.slack-webhook-url != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          REPO="${{ github.repository }}"
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/${VERSION}"
+
+          TEXT=":white_check_mark: *${REPO} released ${VERSION}*\n\n:link: <${RELEASE_URL}|View release notes>\n:ship: Production deploy triggered"
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-type: application/json' \
+            -d "{\"text\": \"${TEXT}\"}"
