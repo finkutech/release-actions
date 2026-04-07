@@ -1,0 +1,166 @@
+name: Release Management
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Name of the staging branch"
+        required: false
+        type: string
+        default: "staging"
+      main-branch:
+        description: "Name of the main/production branch"
+        required: false
+        type: string
+        default: "main"
+
+jobs:
+  manage-release-pr:
+    if: >-
+      github.event.pull_request.merged == true
+      && github.event.pull_request.base.ref == inputs.staging-branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-pr-management
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate version string
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE_TAG=$(date -u +"%Y.%m.%d")
+          EXISTING=$(gh api repos/${{ github.repository }}/tags \
+            --paginate --jq '.[].name' | grep "^v${DATE_TAG}\." | sort -t. -k4 -n | tail -1)
+          if [ -z "$EXISTING" ]; then
+            SEQ=1
+          else
+            LAST_SEQ=$(echo "$EXISTING" | rev | cut -d. -f1 | rev)
+            SEQ=$((LAST_SEQ + 1))
+          fi
+          VERSION="v${DATE_TAG}.${SEQ}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing release PR
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+          STAGING_BRANCH: ${{ inputs.staging-branch }}
+        run: |
+          EXISTING_PR=$(gh pr list \
+            --base "$MAIN_BRANCH" \
+            --head "$STAGING_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          if [ -z "$EXISTING_PR" ] || [ "$EXISTING_PR" = "null" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build change entry
+        run: |
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          MERGE_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          echo "| #${PR_NUM} | ${PR_TITLE} | @${PR_AUTHOR} | \`${PR_BRANCH}\` | ${MERGE_DATE} |" > /tmp/entry.txt
+
+      - name: Create release PR
+        if: steps.check_pr.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+          STAGING_BRANCH: ${{ inputs.staging-branch }}
+        run: |
+          ENTRY=$(cat /tmp/entry.txt)
+
+          gh pr create \
+            --base "$MAIN_BRANCH" \
+            --head "$STAGING_BRANCH" \
+            --title "release: ${VERSION}" \
+            --body "$(cat <<EOF
+          ## Release ${VERSION}
+
+          ### Changes in this release
+
+          <!-- RELEASE_CHANGES_START -->
+          | PR | Title | Author | Branch | Merged |
+          |---|---|---|---|---|
+          ${ENTRY}
+          <!-- RELEASE_CHANGES_END -->
+
+          ### Release checklist
+          - [ ] Verified changes on staging
+          - [ ] Reviewed release notes above
+          EOF
+          )"
+
+      - name: Update existing release PR
+        if: steps.check_pr.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.check_pr.outputs.pr_number }}
+        run: |
+          ENTRY=$(cat /tmp/entry.txt)
+
+          CURRENT_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body')
+
+          NEW_BODY=$(echo "$CURRENT_BODY" | sed "/<!-- RELEASE_CHANGES_END -->/i\\
+          ${ENTRY}")
+
+          gh pr edit "$PR_NUMBER" --body "$NEW_BODY"
+
+  tag-release:
+    if: >-
+      github.event.pull_request.merged == true
+      && github.event.pull_request.base.ref == inputs.main-branch
+      && github.event.pull_request.head.ref == inputs.staging-branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from PR title
+        id: version
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          VERSION=$(echo "$PR_TITLE" | grep -oP 'v\d{4}\.\d{2}\.\d{2}\.\d+')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract version from PR title: ${PR_TITLE}"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+          BODY=$(gh pr view "${{ github.event.pull_request.number }}" \
+            --json body --jq '.body')
+
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "$BODY"
