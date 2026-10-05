@@ -1,0 +1,127 @@
+# Uses the caller's GITHUB_TOKEN, so the caller must grant `contents: write`
+# (tag + release) and `packages: write` (publish).
+name: Publish npm package
+
+on:
+  workflow_call:
+    inputs:
+      package-dir:
+        description: "Directory of the package.json to publish, relative to the repo root"
+        required: true
+        type: string
+      tag-prefix:
+        description: "Release tag prefix; the tag is <tag-prefix><version>, e.g. sdk-v"
+        required: true
+        type: string
+      node-version-file:
+        description: "File setup-node reads the Node version from"
+        required: false
+        type: string
+        default: ".nvmrc"
+      install-command:
+        description: "Command that installs dependencies"
+        required: false
+        type: string
+        default: "npm ci"
+      build-command:
+        description: "Command that builds the package"
+        required: false
+        type: string
+        default: "npm run build"
+      scope:
+        description: "npm scope the registry serves"
+        required: false
+        type: string
+        default: "@finkutech"
+      registry-url:
+        description: "npm registry to publish to"
+        required: false
+        type: string
+        default: "https://npm.pkg.github.com"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: publish-npm-${{ github.repository }}-${{ inputs.package-dir }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          registry-url: ${{ inputs.registry-url }}
+          scope: ${{ inputs.scope }}
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Read package name and version
+        id: package
+        working-directory: ${{ inputs.package-dir }}
+        run: |
+          echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the version is published
+        id: registry
+        working-directory: ${{ inputs.package-dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.package.outputs.name }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          if FOUND=$(npm view "${NAME}@${VERSION}" version 2>"$RUNNER_TEMP/npm-view.err"); then
+            :
+          elif grep -q E404 "$RUNNER_TEMP/npm-view.err"; then
+            FOUND=""
+          else
+            cat "$RUNNER_TEMP/npm-view.err" >&2
+            exit 1
+          fi
+
+          case "$FOUND" in
+            "$VERSION")
+              echo "${NAME}@${VERSION} is already published, skipping"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            "")
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unexpected npm view output: ${FOUND}"
+              exit 1
+              ;;
+          esac
+
+      - name: Publish
+        if: steps.registry.outputs.published == 'false'
+        working-directory: ${{ inputs.package-dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: npm publish
+
+      - name: Create GitHub release
+        if: steps.registry.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag-prefix }}${{ steps.package.outputs.version }}
+          TITLE: ${{ steps.package.outputs.name }} ${{ steps.package.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$TITLE" \
+            --generate-notes
