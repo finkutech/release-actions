@@ -3,10 +3,7 @@ name: Release Management
 
 on:
   pull_request:
-    types: [closed]
-    branches:
-      - staging
-      - main
+    types: [opened, closed]
 
 permissions:
   contents: write

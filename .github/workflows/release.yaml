@@ -18,16 +18,22 @@ on:
         required: false
         type: string
         default: "https://finkutech.atlassian.net/browse"
+      ticket-pattern:
+        description: "Case-insensitive regex for ticket keys, matched on the branch name, then the PR title"
+        required: false
+        type: string
+        default: '\bREV-[0-9]+'
     secrets:
       slack-webhook-url:
         description: "Slack Incoming Webhook URL for release notifications"
         required: false
 
 jobs:
+  # Any base except main, so stacked PRs (base = another feature branch) are announced too.
   notify-pr-opened:
     if: >-
       github.event.action == 'opened'
-      && github.event.pull_request.base.ref == inputs.staging-branch
+      && github.event.pull_request.base.ref != inputs.main-branch
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
@@ -36,33 +42,39 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+          TICKET_PATTERN: ${{ inputs.ticket-pattern }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           if [ -z "$SLACK_WEBHOOK_URL" ]; then
             echo "No Slack webhook configured, skipping notification"
             exit 0
           fi
 
-          PR_NUM="${{ github.event.pull_request.number }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          REPO="${{ github.repository }}"
-
-          TICKET=$(echo "$PR_BRANCH" | grep -oP '[A-Z]+-\d+' | head -1)
+          TICKET=$(printf '%s\n%s\n' "$PR_BRANCH" "$PR_TITLE" | grep -oiE "$TICKET_PATTERN" | head -1 | tr '[:lower:]' '[:upper:]')
           if [ -n "$TICKET" ]; then
             TICKET_TEXT=" | <${JIRA_BASE_URL}/${TICKET}|${TICKET}>"
           else
             TICKET_TEXT=""
           fi
 
+          # Slack mrkdwn treats &, <, > as control characters inside links.
+          TITLE=$(printf '%s' "$PR_TITLE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+
           REVIEWERS="<@U050ZKVN022> <@U058JKUUY8K> <@U05D5MQEDGC>"
-          TEXT=":eyes: *Review requested* — <${PR_URL}|#${PR_NUM} ${PR_TITLE}>\n:bust_in_silhouette: ${PR_AUTHOR} → \`${PR_BRANCH}\` → \`staging\`${TICKET_TEXT}\n:bellhop_bell: ${REVIEWERS}"
+          TEXT=":eyes: *Review requested* — <${PR_URL}|#${PR_NUM} ${TITLE}>
+          :bust_in_silhouette: ${PR_AUTHOR} → \`${PR_BRANCH}\` → \`${PR_BASE}\`${TICKET_TEXT}
+          :bellhop_bell: ${REVIEWERS}"
 
-          curl -s -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d "{\"text\": \"${TEXT}\"}"
+          jq -n --arg text "$TEXT" '{text: $text}' \
+            | curl -sSf -X POST "$SLACK_WEBHOOK_URL" -H 'Content-type: application/json' -d @-
 
+  # Rebuilds the whole changes table on every staging merge from the PRs whose commits are in
+  # main..staging, so PRs merged into a stack parent get their own row.
   manage-release-pr:
     if: >-
       github.event.pull_request.merged == true
@@ -77,6 +89,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Generate version string
         id: version
@@ -116,27 +130,8 @@ jobs:
             echo "pr_number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build change entry
-        id: entry
-        env:
-          JIRA_BASE_URL: ${{ inputs.jira-base-url }}
-        run: |
-          PR_NUM="${{ github.event.pull_request.number }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
-          MERGE_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
-
-          TICKET=$(echo "$PR_BRANCH" | grep -oP '[A-Z]+-\d+' | head -1)
-          if [ -n "$TICKET" ]; then
-            TICKET_LINK="[${TICKET}](${JIRA_BASE_URL}/${TICKET})"
-          else
-            TICKET_LINK="-"
-          fi
-
-          echo "| #${PR_NUM} | ${PR_TITLE} | @${PR_AUTHOR} | \`${PR_BRANCH}\` | ${TICKET_LINK} | ${MERGE_DATE} |" > /tmp/entry.txt
-
       - name: Create release PR
+        id: create_pr
         if: steps.check_pr.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -144,9 +139,7 @@ jobs:
           MAIN_BRANCH: ${{ inputs.main-branch }}
           STAGING_BRANCH: ${{ inputs.staging-branch }}
         run: |
-          ENTRY=$(cat /tmp/entry.txt)
-
-          gh pr create \
+          PR_URL=$(gh pr create \
             --base "$MAIN_BRANCH" \
             --head "$STAGING_BRANCH" \
             --title "release: ${VERSION}" \
@@ -156,31 +149,65 @@ jobs:
           ### Changes in this release
 
           <!-- RELEASE_CHANGES_START -->
-          | PR | Title | Author | Branch | Ticket | Merged |
-          |---|---|---|---|---|---|
-          ${ENTRY}
           <!-- RELEASE_CHANGES_END -->
 
           ### Release checklist
           - [ ] Verified changes on staging
           - [ ] Reviewed release notes above
           EOF
-          )"
+          )")
+          echo "pr_number=${PR_URL##*/}" >> "$GITHUB_OUTPUT"
 
-      - name: Update existing release PR
-        if: steps.check_pr.outputs.exists == 'true'
+      - name: Rebuild changes table
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.check_pr.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.check_pr.outputs.pr_number || steps.create_pr.outputs.pr_number }}
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+          STAGING_BRANCH: ${{ inputs.staging-branch }}
+          JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+          TICKET_PATTERN: ${{ inputs.ticket-pattern }}
         run: |
-          ENTRY=$(cat /tmp/entry.txt)
+          set -o pipefail
+          git fetch -q origin "$MAIN_BRANCH" "$STAGING_BRANCH"
+          git rev-list "origin/${MAIN_BRANCH}..origin/${STAGING_BRANCH}" > /tmp/shas.txt
 
-          CURRENT_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body')
+          # A PR is in the release when its head or merge commit is in main..staging. Back-merges
+          # and release PRs are excluded by branch. Only the 200 most recently created merged PRs are scanned.
+          gh pr list --state merged --limit 200 \
+            --json number,title,author,headRefName,baseRefName,mergedAt,mergeCommit,headRefOid \
+          | jq -r \
+            --rawfile shas /tmp/shas.txt \
+            --arg main "$MAIN_BRANCH" \
+            --arg staging "$STAGING_BRANCH" \
+            --arg jira "$JIRA_BASE_URL" \
+            --arg pattern "$TICKET_PATTERN" '
+              ($shas | split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries) as $in
+              | map(select(
+                  .baseRefName != $main and .headRefName != $main and .headRefName != $staging
+                  and ($in[.headRefOid] or $in[.mergeCommit.oid // ""])))
+              | sort_by(.mergedAt)
+              | .[]
+              | ([.headRefName, .title] | map([match($pattern; "i").string][0]) | map(select(. != null)) | first) as $t
+              | "| #\(.number) | \(.title | gsub("\\|"; "\\|")) | @\(.author.login) | `\(.headRefName)` | "
+                + (if $t then "[\($t | ascii_upcase)](\($jira)/\($t | ascii_upcase))" else "-" end)
+                + " | \(.mergedAt[0:16] | sub("T"; " ")) UTC |"
+            ' > /tmp/rows.md
 
-          NEW_BODY=$(echo "$CURRENT_BODY" | sed "/<!-- RELEASE_CHANGES_END -->/i\\
-          ${ENTRY}")
+          gh pr view "$PR_NUMBER" --json body --jq '.body' > /tmp/body.md
 
-          gh pr edit "$PR_NUMBER" --body "$NEW_BODY"
+          python3 - <<'PY'
+          start, end = "<!-- RELEASE_CHANGES_START -->", "<!-- RELEASE_CHANGES_END -->"
+          body = open("/tmp/body.md").read()
+          rows = open("/tmp/rows.md").read()
+          if start not in body or end not in body:
+              raise SystemExit(f"::error::Release PR body is missing {start} / {end}")
+          table = "| PR | Title | Author | Branch | Ticket | Merged |\n|---|---|---|---|---|---|\n" + rows
+          head, rest = body.split(start, 1)
+          tail = rest.split(end, 1)[1]
+          open("/tmp/body.md", "w").write(f"{head}{start}\n{table}{end}{tail}")
+          PY
+
+          gh pr edit "$PR_NUMBER" --body-file /tmp/body.md
 
   tag-release:
     if: >-
